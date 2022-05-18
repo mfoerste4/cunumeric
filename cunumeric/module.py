@@ -16,10 +16,7 @@
 import math
 import re
 from collections import Counter
-from functools import wraps
-from inspect import signature
 from itertools import chain
-from typing import Optional, Set
 
 import numpy as np
 import opt_einsum as oe
@@ -27,11 +24,7 @@ from cunumeric._ufunc.comparison import maximum, minimum
 from cunumeric._ufunc.floating import floor
 from cunumeric._ufunc.math import add, multiply
 
-from .array import (
-    convert_to_cunumeric_ndarray,
-    convert_to_predicate_ndarray,
-    ndarray,
-)
+from .array import add_boilerplate, convert_to_cunumeric_ndarray, ndarray
 from .config import BinaryOpCode, UnaryRedCode
 from .runtime import runtime
 from .utils import inner_modes, matmul_modes, tensordot_modes
@@ -42,111 +35,6 @@ _builtin_any = any
 _builtin_max = max
 _builtin_min = min
 _builtin_sum = sum
-
-
-def add_boilerplate(*array_params: str):
-    """
-    Adds required boilerplate to the wrapped module-level ndarray function.
-
-    Every time the wrapped function is called, this wrapper will:
-    * Convert all specified array-like parameters, plus the special "out"
-      parameter (if present), to cuNumeric ndarrays.
-    * Convert the special "where" parameter (if present) to a valid predicate.
-    * Handle the case of scalar cuNumeric ndarrays, by forwarding the operation
-      to the equivalent `()`-shape numpy array (if the operation exists on base
-      numpy).
-
-    NOTE: Assumes that no parameters are mutated besides `out`.
-    """
-    keys: Set[str] = set(array_params)
-
-    def decorator(func):
-        assert not hasattr(
-            func, "__wrapped__"
-        ), "this decorator must be the innermost"
-
-        # For each parameter specified by name, also consider the case where
-        # it's passed as a positional parameter.
-        indices: Set[int] = set()
-        all_formals: Set[str] = set()
-        where_idx: Optional[int] = None
-        out_idx: Optional[int] = None
-        for (idx, param) in enumerate(signature(func).parameters):
-            all_formals.add(param)
-            if param == "where":
-                where_idx = idx
-            elif param == "out":
-                out_idx = idx
-            elif param in keys:
-                indices.add(idx)
-        assert len(keys - all_formals) == 0, "unkonwn parameter(s)"
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            assert (where_idx is None or len(args) <= where_idx) and (
-                out_idx is None or len(args) <= out_idx
-            ), "'where' and 'out' should be passed as keyword arguments"
-
-            # Convert relevant arguments to cuNumeric ndarrays
-            args = tuple(
-                convert_to_cunumeric_ndarray(arg)
-                if idx in indices and arg is not None
-                else arg
-                for (idx, arg) in enumerate(args)
-            )
-            for (k, v) in kwargs.items():
-                if v is None:
-                    continue
-                elif k == "where":
-                    kwargs[k] = convert_to_predicate_ndarray(v)
-                elif k == "out":
-                    kwargs[k] = convert_to_cunumeric_ndarray(v, share=True)
-                elif k in keys:
-                    kwargs[k] = convert_to_cunumeric_ndarray(v)
-
-            # Handle the case where all array-like parameters are scalar, by
-            # performing the operation on the equivalent scalar numpy arrays.
-            # NOTE: This implicitly blocks on the contents of these arrays.
-            if (
-                hasattr(np, func.__name__)
-                and _builtin_all(
-                    isinstance(args[idx], ndarray) and args[idx]._thunk.scalar
-                    for idx in indices
-                )
-                and _builtin_all(
-                    isinstance(v, ndarray) and v._thunk.scalar
-                    for v in (kwargs.get("where", None),)
-                )
-            ):
-                out = None
-                if "out" in kwargs:
-                    out = kwargs["out"]
-                    del kwargs["out"]
-                args = tuple(
-                    arg._thunk.__numpy_array__()
-                    if (idx in indices) and isinstance(arg, ndarray)
-                    else arg
-                    for (idx, arg) in enumerate(args)
-                )
-                for (k, v) in kwargs.items():
-                    if (k in keys or k == "where") and isinstance(v, ndarray):
-                        kwargs[k] = v._thunk.__numpy_array__()
-                result = convert_to_cunumeric_ndarray(
-                    getattr(np, func.__name__)(*args, **kwargs)
-                )
-                if out is not None:
-                    if out._thunk.dtype != result._thunk.dtype:
-                        out._thunk.convert(result._thunk, warn=False)
-                    else:
-                        out._thunk.copy(result._thunk)
-                    result = out
-                return result
-
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 #########################
@@ -1335,7 +1223,7 @@ def _block_collect_slices(arr, cur_depth, depth):
             )
             common_shape = common_info.shape
         # the initial slices for each arr on arr.shape[-1]
-        out_shape, slices = _collect_outshape_slices(
+        out_shape, slices, arrays = _collect_outshape_slices(
             arrays, common_shape, axis=-1 + len(common_shape)
         )
 
@@ -1361,14 +1249,12 @@ def _collect_outshape_slices(inputs, common_shape, axis):
     slices = []
     offset = 0
     # collect slices for arrays in `inputs`
+    inputs = list(inp for inp in inputs if inp.size > 0)
     for inp in inputs:
-        if inp.size > 0:
-            slices.append(
-                (slice(offset, offset + inp.shape[axis]),) + post_idx
-            )
-            offset += inp.shape[axis]
+        slices.append((slice(offset, offset + inp.shape[axis]),) + post_idx)
+        offset += inp.shape[axis]
 
-    return out_shape, slices
+    return out_shape, slices, inputs
 
 
 def _concatenate(
@@ -1381,7 +1267,7 @@ def _concatenate(
 ):
     if axis < 0:
         axis += len(common_info.shape)
-    out_shape, slices = _collect_outshape_slices(
+    out_shape, slices, inputs = _collect_outshape_slices(
         inputs, common_info.shape, axis
     )
 
@@ -1401,8 +1287,7 @@ def _concatenate(
         out_array = out
 
     for dest, src in zip(slices, inputs):
-        if src.size > 0:
-            out_array[(Ellipsis,) + dest] = src
+        out_array[(Ellipsis,) + dest] = src
 
     return out_array
 
@@ -3138,6 +3023,7 @@ def einsum(expr, *operands, out=None, optimize=False):
     --------
     Multiple GPUs, Multiple CPUs
     """
+    operands = [convert_to_cunumeric_ndarray(op) for op in operands]
     if not optimize:
         optimize = NullOptimizer()
     # This call normalizes the expression (adds the output part if it's
@@ -3177,6 +3063,87 @@ def einsum(expr, *operands, out=None, optimize=False):
         operands.append(sub_result)
     assert len(operands) == 1
     return operands[0]
+
+
+def einsum_path(expr, *operands, optimize="greedy"):
+    """
+    Evaluates the lowest cost contraction order for an einsum expression by
+    considering the creation of intermediate arrays.
+
+    Parameters
+    ----------
+    expr : str
+        Specifies the subscripts for summation.
+    *operands : list of array_like
+        These are the arrays for the operation.
+    optimize : {bool, list, tuple, 'greedy', 'optimal'}
+        Choose the type of path. If a tuple is provided, the second argument is
+        assumed to be the maximum intermediate size created. If only a single
+        argument is provided the largest input or output array size is used
+        as a maximum intermediate size.
+        * if a list is given that starts with ``einsum_path``, uses this as the
+          contraction path
+        * if False no optimization is taken
+        * if True defaults to the 'greedy' algorithm
+        * 'optimal' An algorithm that combinatorially explores all possible
+          ways of contracting the listed tensors and chooses the least costly
+          path. Scales exponentially with the number of terms in the
+          contraction.
+        * 'greedy' An algorithm that chooses the best pair contraction
+          at each step. Effectively, this algorithm searches the largest inner,
+          Hadamard, and then outer products at each step. Scales cubically with
+          the number of terms in the contraction. Equivalent to the 'optimal'
+          path for most contractions.
+        Default is 'greedy'.
+
+    Returns
+    -------
+    path : list of tuples
+        A list representation of the einsum path.
+    string_repr : str
+        A printable representation of the einsum path.
+
+    Notes
+    -----
+    The resulting path indicates which terms of the input contraction should be
+    contracted first, the result of this contraction is then appended to the
+    end of the contraction list. This list can then be iterated over until all
+    intermediate contractions are complete.
+
+    See Also
+    --------
+    numpy.einsum_path
+
+    Availability
+    --------
+    Multiple GPUs, Multiple CPUs
+    """
+    operands = [convert_to_cunumeric_ndarray(op) for op in operands]
+    memory_limit = _builtin_max(op.size for op in operands)
+    if type(optimize) == tuple:
+        if len(optimize) != 2:
+            raise ValueError("einsum_path expects optimize tuples of size 2")
+        optimize, memory_limit = optimize
+    if optimize is True:
+        optimize = "greedy"
+    elif optimize is False:
+        optimize = [tuple(range(len(operands)))]
+    elif optimize in ["greedy", "optimal"]:
+        pass
+    elif (
+        type(optimize) == list
+        and len(optimize) > 1
+        and optimize[0] == "einsum_path"
+    ):
+        optimize = optimize[1:]
+    else:
+        raise ValueError(
+            f"einsum_path: unexpected value for optimize: {optimize}"
+        )
+    path, info = oe.contract_path(
+        expr, *operands, optimize=optimize, memory_limit=memory_limit
+    )
+    return ["einsum_path"] + path, info
 
 
 @add_boilerplate("a")
