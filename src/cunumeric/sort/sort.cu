@@ -636,7 +636,7 @@ SegmentMergePiece<legate_type_of<CODE>> merge_all_buffers(
   using VAL = legate_type_of<CODE>;
 
   // fallback to full sort for 1D and > 64 parts
-  if (!segmented && merge_buffers.size() > 64) {
+  if (false && !segmented && merge_buffers.size() > 64) {
     SegmentMergePiece<VAL> result;
 
     // initialize target
@@ -1731,127 +1731,59 @@ struct SortImplBody<VariantKind::GPU, CODE, DIM> {
 
     // we allow empty domains for distributed sorting
     assert(rect.empty() || input.accessor.is_dense_row_major(rect));
+    assert(!argsort);
+    assert(volume == segment_size_l);
 
-    auto stream = get_cached_stream();
+    auto stream           = get_cached_stream();
+    size_t num_chunks     = 256;
+    size_t size_per_chunk = volume / num_chunks;
+    assert(volume % num_chunks == 0);
 
-    bool is_unbound_1d_storage = output_array.dim() == -1;
-    bool need_distributed_sort = segment_size_l != segment_size_g || is_unbound_1d_storage;
-    bool rebalance             = !is_unbound_1d_storage;
-    assert(DIM == 1 || !is_unbound_1d_storage);
+    auto input_sorted = create_buffer<VAL>(volume, Memory::GPU_FB_MEM);
+    local_sort<CODE>(input.ptr(rect.lo),
+                     input_sorted.ptr(0),
+                     nullptr,
+                     nullptr,
+                     volume,
+                     size_per_chunk,
+                     false,
+                     stream);
 
-    // initialize sort pointers
-    SortPiece<VAL> local_sorted;
-    int64_t* indices_ptr = nullptr;
-    VAL* values_ptr      = nullptr;
-    if (argsort) {
-      // make a buffer for input
-      auto input_copy     = create_buffer<VAL>(volume, Legion::Memory::Kind::GPU_FB_MEM);
-      local_sorted.values = input_copy;
-      values_ptr          = input_copy.ptr(0);
-
-      // initialize indices
-      if (need_distributed_sort) {
-        auto indices_buffer  = create_buffer<int64_t>(volume, Legion::Memory::Kind::GPU_FB_MEM);
-        indices_ptr          = indices_buffer.ptr(0);
-        local_sorted.indices = indices_buffer;
-        local_sorted.size    = volume;
-      } else {
-        AccessorWO<int64_t, DIM> output = output_array.write_accessor<int64_t, DIM>(rect);
-        assert(rect.empty() || output.accessor.is_dense_row_major(rect));
-        indices_ptr = output.ptr(rect.lo);
-      }
-      size_t offset = rect.lo[DIM - 1];
-      if (volume > 0) {
-        if (DIM == 1) {
-          thrust::sequence(thrust::cuda::par.on(stream), indices_ptr, indices_ptr + volume, offset);
-        } else {
-          thrust::transform(thrust::cuda::par.on(stream),
-                            thrust::make_counting_iterator<int64_t>(0),
-                            thrust::make_counting_iterator<int64_t>(volume),
-                            thrust::make_constant_iterator<int64_t>(segment_size_l),
-                            indices_ptr,
-                            modulusWithOffset(offset));
-        }
-      }
-    } else {
-      // initialize output
-      if (need_distributed_sort) {
-        auto input_copy      = create_buffer<VAL>(volume, Legion::Memory::Kind::GPU_FB_MEM);
-        values_ptr           = input_copy.ptr(0);
-        local_sorted.values  = input_copy;
-        local_sorted.indices = create_buffer<int64_t>(0, Legion::Memory::Kind::GPU_FB_MEM);
-        local_sorted.size    = volume;
-      } else {
-        AccessorWO<VAL, DIM> output = output_array.write_accessor<VAL, DIM>(rect);
-        assert(rect.empty() || output.accessor.is_dense_row_major(rect));
-        values_ptr = output.ptr(rect.lo);
+    // split data into merge buffers
+    std::vector<SegmentMergePiece<VAL>> merge_buffers(num_chunks);
+    for (int i = 0; i < num_chunks; ++i) {
+      merge_buffers[i].values  = create_buffer<VAL>(size_per_chunk, Memory::GPU_FB_MEM);
+      merge_buffers[i].indices = create_buffer<int64_t>(0, Memory::GPU_FB_MEM);
+      size_t start             = std::min(volume, i * size_per_chunk);
+      size_t end               = std::min(volume, (i + 1) * size_per_chunk);
+      merge_buffers[i].size    = end - start;
+      if (merge_buffers[i].size > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(merge_buffers[i].values.ptr(0),
+                                   input_sorted.ptr(start),
+                                   merge_buffers[i].size * sizeof(VAL),
+                                   cudaMemcpyDeviceToDevice,
+                                   stream));
       }
     }
-    CHECK_CUDA_STREAM(stream);
+    input_sorted.destroy();
+    CHECK_CUDA(cudaStreamSynchronize(stream));
 
-    if (volume > 0) {
-      // sort data (locally)
-      local_sort<CODE>(input.ptr(rect.lo),
-                       values_ptr,
-                       indices_ptr,
-                       indices_ptr,
-                       volume,
-                       segment_size_l,
-                       stable,
-                       stream);
-    }
-    CHECK_CUDA_STREAM(stream);
+    auto alloc = ThrustAllocator(Memory::GPU_FB_MEM);
+    // now merge sort all into the result buffer
+    SegmentMergePiece<VAL> merged_result =
+      merge_all_buffers<CODE>(merge_buffers, false, false, alloc, stream);
 
-    if (need_distributed_sort) {
-      if (is_index_space) {
-        assert(is_index_space || is_unbound_1d_storage);
-        std::vector<size_t> sort_ranks(num_sort_ranks);
-        size_t rank_group = local_rank / num_sort_ranks;
-        for (int r = 0; r < num_sort_ranks; ++r) sort_ranks[r] = rank_group * num_sort_ranks + r;
+    // copy to output
+    auto output = output_array.write_accessor<VAL, DIM>(rect);
+    assert(merged_result.size == volume);
+    CHECK_CUDA(cudaMemcpyAsync(output.ptr(rect.lo),
+                               merged_result.values.ptr(0),
+                               merged_result.size * sizeof(VAL),
+                               cudaMemcpyDeviceToDevice,
+                               stream));
+    merged_result.values.destroy();
 
-        void* output_ptr = nullptr;
-        // in case the storage *is NOT* unbound -- we provide a target pointer
-        // in case the storage *is* unbound -- the result will be appended to output_array
-        if (volume > 0 && !is_unbound_1d_storage) {
-          if (argsort) {
-            auto output = output_array.write_accessor<int64_t, DIM>(rect);
-            assert(output.accessor.is_dense_row_major(rect));
-            output_ptr = static_cast<void*>(output.ptr(rect.lo));
-          } else {
-            auto output = output_array.write_accessor<VAL, DIM>(rect);
-            assert(output.accessor.is_dense_row_major(rect));
-            output_ptr = static_cast<void*>(output.ptr(rect.lo));
-          }
-        }
-
-        sample_sort_nccl_nd<CODE>(local_sorted,
-                                  output_array,
-                                  output_ptr,
-                                  local_rank,
-                                  num_ranks,
-                                  segment_size_g,
-                                  local_rank % num_sort_ranks,
-                                  num_sort_ranks,
-                                  sort_ranks.data(),
-                                  segment_size_l,
-                                  rebalance,
-                                  argsort,
-                                  stream,
-                                  comms[0].get<ncclComm_t*>());
-      } else {
-        // edge case where we have an unbound store but only 1 GPU was assigned with the task
-        if (argsort) {
-          local_sorted.values.destroy();
-          output_array.return_data(local_sorted.indices, Point<1>(local_sorted.size));
-        } else {
-          output_array.return_data(local_sorted.values, Point<1>(local_sorted.size));
-        }
-      }
-    } else if (argsort) {
-      // cleanup for non distributed argsort
-      local_sorted.values.destroy();
-    }
-
+    CHECK_CUDA(cudaStreamSynchronize(stream));
     CHECK_CUDA_STREAM(stream);
   }
 };
