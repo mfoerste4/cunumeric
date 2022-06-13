@@ -69,6 +69,7 @@ struct SortImplBody<VariantKind::CPU, CODE, DIM> {
                   const size_t segment_size_g,
                   const bool argsort,
                   const bool stable,
+                  const std::vector<int64_t>& partition_kths,
                   const bool is_index_space,
                   const size_t local_rank,
                   const size_t num_ranks,

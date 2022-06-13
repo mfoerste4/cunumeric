@@ -1925,8 +1925,8 @@ class DeferredArray(NumPyThunk):
         if axis is not None and (axis >= rhs.ndim or axis < -rhs.ndim):
             raise ValueError("invalid axis")
 
-        # fallback to sort for now
-        sort(self, rhs, argpartition, axis, False)
+        # use sort API with flag to skip un-needed communication
+        sort(self, rhs, argpartition, axis, False, kth=kth)
 
     def create_window(self, op_code, M, *args):
         task = self.context.create_task(CuNumericOpCode.WINDOW)

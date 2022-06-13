@@ -14,24 +14,26 @@
 #
 
 
+from collections.abc import Iterable
+
 from cunumeric.config import CuNumericOpCode
 
 from legate.core import types as ty
 
 
-def sort_flattened(output, input, argsort, stable):
+def sort_flattened(output, input, argsort, stable, kth):
     flattened = input.reshape((input.size,), order="C")
 
     # run sort flattened -- return 1D solution
     sort_result = output.runtime.create_empty_thunk(
         flattened.shape, dtype=output.dtype, inputs=(flattened,)
     )
-    sort(sort_result, flattened, argsort, stable=stable)
+    sort(sort_result, flattened, argsort, stable=stable, kth=kth)
     output.base = sort_result.base
     output.numpy_array = None
 
 
-def sort_swapped(output, input, argsort, sort_axis, stable):
+def sort_swapped(output, input, argsort, sort_axis, stable, kth):
     assert sort_axis < input.ndim - 1 and sort_axis >= 0
 
     # swap axes
@@ -47,16 +49,16 @@ def sort_swapped(output, input, argsort, sort_axis, stable):
         sort_result = output.runtime.create_empty_thunk(
             swapped_copy.shape, dtype=output.dtype, inputs=(swapped_copy,)
         )
-        sort(sort_result, swapped_copy, argsort, stable=stable)
+        sort(sort_result, swapped_copy, argsort, stable=stable, kth=kth)
         output.base = sort_result.swapaxes(input.ndim - 1, sort_axis).base
         output.numpy_array = None
     else:
-        sort(swapped_copy, swapped_copy, argsort, stable=stable)
+        sort(swapped_copy, swapped_copy, argsort, stable=stable, kth=kth)
         output.base = swapped_copy.swapaxes(input.ndim - 1, sort_axis).base
         output.numpy_array = None
 
 
-def sort_task(output, input, argsort, stable):
+def sort_task(output, input, argsort, stable, kth):
     task = output.context.create_task(CuNumericOpCode.SORT)
 
     uses_unbound_output = output.runtime.num_gpus > 1 and input.ndim == 1
@@ -84,6 +86,14 @@ def sort_task(output, input, argsort, stable):
     task.add_scalar_arg(argsort, bool)  # return indices flag
     task.add_scalar_arg(input.base.shape, (ty.int64,))
     task.add_scalar_arg(stable, bool)
+    if kth is None:
+        task.add_scalar_arg((), (ty.int64,))
+    # if not None data is partitioned at kth
+    elif isinstance(kth, Iterable):
+        task.add_scalar_arg(tuple(kth), (ty.int64,))
+    else:
+        task.add_scalar_arg((kth,), (ty.int64,))
+
     task.execute()
 
     if uses_unbound_output:
@@ -91,9 +101,9 @@ def sort_task(output, input, argsort, stable):
         output.numpy_array = None
 
 
-def sort(output, input, argsort, axis=-1, stable=False):
+def sort(output, input, argsort, axis=-1, stable=False, kth=None):
     if axis is None and input.ndim > 1:
-        sort_flattened(output, input, argsort, stable)
+        sort_flattened(output, input, argsort, stable, kth)
     else:
         if axis is None:
             axis = 0
@@ -101,8 +111,8 @@ def sort(output, input, argsort, axis=-1, stable=False):
             axis = input.ndim + axis
 
         if axis is not input.ndim - 1:
-            sort_swapped(output, input, argsort, axis, stable)
+            sort_swapped(output, input, argsort, axis, stable, kth)
 
         else:
             # run actual sort task
-            sort_task(output, input, argsort, stable)
+            sort_task(output, input, argsort, stable, kth)

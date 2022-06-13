@@ -38,7 +38,7 @@ def check_sorted(a, a_sorted, axis=-1):
 
 
 def run_sort(
-    shape, axis, argsort, datatype, lower, upper, perform_check, timing
+    shape, axis, argsort, kth, datatype, lower, upper, perform_check, timing
 ):
 
     num.random.seed(42)
@@ -48,6 +48,7 @@ def run_sort(
     for e in shape:
         N *= e
     shape = tuple(shape)
+    kth = tuple(kth)
 
     if np.issubdtype(newtype, np.integer):
         if lower is None:
@@ -67,13 +68,19 @@ def run_sort(
         assert False
 
     start = time()
-    if argsort:
-        a_sorted = num.argsort(a, axis)
+    if len(kth) > 0:
+        if argsort:
+            a_sorted = num.argpartition(a, kth, axis)
+        else:
+            a_sorted = num.partition(a, kth, axis)
     else:
-        a_sorted = num.sort(a, axis)
+        if argsort:
+            a_sorted = num.argsort(a, axis)
+        else:
+            a_sorted = num.sort(a, axis)
     stop = time()
 
-    if perform_check and not argsort:
+    if perform_check and not argsort and len(kth) == 0:
         check_sorted(a, a_sorted, axis)
     else:
         # do we need to synchronize?
@@ -149,6 +156,15 @@ if __name__ == "__main__":
         help="use argsort",
     )
     parser.add_argument(
+        "-k",
+        "--kth",
+        type=int,
+        nargs="+",
+        default=[],
+        dest="kth",
+        help="partition kth (default '[]')",
+    )
+    parser.add_argument(
         "-b",
         "--benchmark",
         type=int,
@@ -167,6 +183,7 @@ if __name__ == "__main__":
             args.shape,
             args.axis,
             args.argsort,
+            args.kth,
             args.datatype,
             args.lower,
             args.upper,

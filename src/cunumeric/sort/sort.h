@@ -25,6 +25,7 @@ struct SortArgs {
   Array& output;
   bool argsort;
   bool stable;
+  const std::vector<int64_t>& partition_kths;
   size_t segment_size_g;
   bool is_index_space;
   size_t local_rank;

@@ -72,6 +72,7 @@ struct SortImpl {
                                     args.segment_size_g,
                                     args.argsort,
                                     args.stable,
+                                    args.partition_kths,
                                     args.is_index_space,
                                     args.local_rank,
                                     args.num_ranks,
@@ -90,10 +91,15 @@ static void sort_template(TaskContext& context)
   size_t num_ranks      = domain.get_volume();
   size_t num_sort_ranks = domain.hi()[domain.get_dim() - 1] - domain.lo()[domain.get_dim() - 1] + 1;
 
+  auto partition_kths_span = context.scalars()[3].values<int64_t>();
+  auto partition_kths      = std::vector<int64_t>(partition_kths_span.size());
+  for (int i = 0; i < partition_kths_span.size(); ++i) partition_kths[i] = partition_kths_span[i];
+
   SortArgs args{context.inputs()[0],
                 context.outputs()[0],
                 context.scalars()[0].value<bool>(),  // argsort
                 context.scalars()[2].value<bool>(),  // stable
+                partition_kths,                      // kths - partition indices (empty for sort)
                 segment_size_g,
                 !context.is_single_task(),
                 local_rank,

@@ -22,6 +22,7 @@
 
 #include <thrust/scan.h>
 #include <thrust/sort.h>
+#include <thrust/unique.h>
 #include <thrust/device_vector.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/constant_iterator.h>
@@ -221,6 +222,46 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
 }
 
 __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
+  extract_ranks_for_partition(int64_t* max_lower_per_block,
+                              int64_t* min_higher_per_block,
+                              int64_t* partition_kths_buffer,
+                              const size_t* sizes_per_segment_global_transposed,
+                              const size_t num_kths,
+                              const size_t num_segments_l,
+                              const size_t my_sort_rank,
+                              const size_t num_sort_ranks)
+{
+  typedef cub::BlockReduce<int64_t, THREADS_PER_BLOCK> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+
+  const int64_t search_position = partition_kths_buffer[blockIdx.y];
+  const size_t segment          = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
+
+  int64_t thread_max, thread_min;
+  if (segment < num_segments_l) {
+    const size_t offset = segment * num_sort_ranks;
+    size_t split_rank   = cub::UpperBound(
+      sizes_per_segment_global_transposed + offset, num_sort_ranks, search_position);
+    thread_min = split_rank < my_sort_rank ? num_sort_ranks : split_rank;
+    thread_max = split_rank > my_sort_rank ? (int64_t)-1 : (int64_t)split_rank;
+  } else {
+    thread_min = num_sort_ranks;
+    thread_max = -1;
+  }
+
+  // block max (largest split-rank <= my_sort_rank)
+  int64_t max_lower = BlockReduce(temp_storage).Reduce(thread_max, cub::Max());
+  // block min (smallest split-rank >= my_sort_rank)
+  int64_t min_higher = BlockReduce(temp_storage).Reduce(thread_min, cub::Min());
+
+  if (threadIdx.x == 0) {
+    size_t pos                = blockIdx.x * blockDim.y + blockIdx.y;
+    max_lower_per_block[pos]  = max_lower;
+    min_higher_per_block[pos] = min_higher;
+  }
+}
+
+__global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   compute_send_dimensions(const size_t segment_size_l,
                           size_t* size_send,
                           const size_t num_segments_l,
@@ -300,6 +341,76 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
   }
   // also store sum of all in last element
   if (threadId == 0) { size_send[rank * num_segments_l_aligned + num_segments_l] = prefix_op(0); }
+}
+
+/**
+ * Perform row-wise scan operation. Each block handles one row.
+ * In-place operation allowed
+ */
+__global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM) compute_scan_per_row(
+  size_t* output, const size_t* input, const size_t row_length, const bool exclusive)
+{
+  assert(blockDim.x == THREADS_PER_BLOCK);
+
+  // Specialize BlockScan for a 1D block of THREADS_PER_BLOCK threads on type size_t
+  typedef cub::BlockScan<size_t, THREADS_PER_BLOCK> BlockScan;
+  // Allocate shared memory for BlockScan
+  __shared__ typename BlockScan::TempStorage temp_storage;
+
+  // now we have 1 block per row!
+  const size_t row      = blockIdx.x;
+  const size_t threadId = threadIdx.x;
+
+  // Initialize running total
+  BlockPrefixCallbackOp prefix_op(0);
+
+  // Have the block iterate over segments of items - all threads must iterate the same amount!
+  for (int block_offset = 0; block_offset < row_length; block_offset += THREADS_PER_BLOCK) {
+    size_t thread_data = 0;
+    // Load a segment of consecutive items that are blocked across threads
+    if (block_offset + threadId < row_length) {
+      thread_data = input[row * row_length + block_offset + threadId];
+    }
+
+    // Collectively compute the block-wide exclusive prefix sum
+    if (exclusive) {
+      BlockScan(temp_storage).ExclusiveSum(thread_data, thread_data, prefix_op);
+    } else {
+      BlockScan(temp_storage).InclusiveSum(thread_data, thread_data, prefix_op);
+    }
+    __syncthreads();
+
+    // Store scanned items to output segment
+    if (block_offset + threadId < row_length) {
+      output[row * row_length + block_offset + threadId] = thread_data;
+    }
+  }
+}
+
+__global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
+  compute_sum_per_row(size_t* output, size_t* input, size_t row_length)
+{
+  assert(blockDim.x == THREADS_PER_BLOCK);
+
+  // Specialize BlockReduce for a 1D block of THREADS_PER_BLOCK threads of type int
+  typedef cub::BlockReduce<size_t, THREADS_PER_BLOCK> BlockReduce;
+
+  // Allocate shared memory for BlockReduce
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+
+  // now we have 1 block per row!
+  const size_t row      = blockIdx.x;
+  const size_t threadId = threadIdx.x;
+
+  // Have the block iterate over all elements of items
+  const size_t row_offset = row * row_length;
+  size_t thread_data      = 0;
+  for (int i = threadId; i < row_length; i += THREADS_PER_BLOCK) {
+    thread_data += input[row_offset + i];
+  }
+
+  size_t aggregate = BlockReduce(temp_storage).Sum(thread_data);
+  if (threadId == 0) output[row] = aggregate;
 }
 
 __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
@@ -554,9 +665,10 @@ __global__ static void __launch_bounds__(THREADS_PER_BLOCK, MIN_CTAS_PER_SM)
 
 // transpose from CUDA SDK
 #define BLOCK_DIM 16
-__global__ void transpose(int64_t* odata, int64_t* idata, int width, int height)
+template <typename VAL>
+__global__ void transpose(VAL* odata, VAL* idata, int width, int height)
 {
-  __shared__ int64_t block[BLOCK_DIM][BLOCK_DIM + 1];
+  __shared__ VAL block[BLOCK_DIM][BLOCK_DIM + 1];
 
   // read the matrix tile into shared memory
   unsigned int xIndex = blockIdx.x * BLOCK_DIM + threadIdx.x;
@@ -1237,6 +1349,11 @@ void rebalance_data(SegmentMergePiece<VAL>& merge_buffer,
   }
 }
 
+bool is_rank_valid(const std::set<size_t>& skip_ranks, const size_t rank)
+{
+  return skip_ranks.find(rank) == skip_ranks.end();
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1260,6 +1377,7 @@ void sample_sort_nccl_nd(SortPiece<legate_type_of<CODE>> local_sorted,
                          /* other */
                          bool rebalance,
                          bool argsort,
+                         const std::vector<int64_t>& partition_kths,  // non-empty for partition
                          cudaStream_t stream,
                          ncclComm_t* comm)
 {
@@ -1482,8 +1600,131 @@ void sample_sort_nccl_nd(SortPiece<legate_type_of<CODE>> local_sorted,
   }
   CHECK_NCCL(ncclGroupEnd());
 
+  // take recv-data, transpose and sum to get future size for each segment.
+  // Then allreduce the sum values.
+  // Then scan to get global offsets for each segment
+  // Then identify all sort-rank ids belonging to any k in a set
+  // create local set with all sort-ranks we can skip to communicate with
+  // continue with part 3 restricting all sort_rank-loops and kernels to r that are needed
+  // TODO: heuristic on when to do this!
+  std::set<size_t> skip_comm_ranks;
+  if (!partition_kths.empty()) {
+    // copy to transpose structure [segments][ranks]
+    auto size_recv_transposed =
+      create_buffer<size_t>(num_segments_l_aligned * num_sort_ranks, Memory::GPU_FB_MEM);
+    {
+      dim3 grid((num_segments_l_aligned + BLOCK_DIM - 1) / BLOCK_DIM,
+                (num_sort_ranks + BLOCK_DIM - 1) / BLOCK_DIM);
+      dim3 block(BLOCK_DIM, BLOCK_DIM);
+      transpose<<<grid, block, 0, stream>>>(
+        size_recv_transposed.ptr(0), size_recv.ptr(0), num_segments_l_aligned, num_sort_ranks);
+    }
+
+    // kernel reduce rows
+    auto sizes_per_segment = create_buffer<size_t>(num_segments_l_aligned, Memory::GPU_FB_MEM);
+    compute_sum_per_row<<<num_segments_l_aligned, THREADS_PER_BLOCK, 0, stream>>>(
+      sizes_per_segment.ptr(0), size_recv_transposed.ptr(0), num_sort_ranks);
+    size_recv_transposed.destroy();
+
+    // communicate those values into global size matrix [rank][num_segments_l_aligned]
+    auto sizes_per_segment_global =
+      create_buffer<size_t>(num_segments_l_aligned * num_sort_ranks, Memory::GPU_FB_MEM);
+    CHECK_NCCL(ncclGroupStart());
+    for (size_t r = 0; r < num_sort_ranks; r++) {
+      CHECK_NCCL(ncclSend(sizes_per_segment.ptr(0),
+                          num_segments_l_aligned,
+                          ncclUint64,
+                          sort_ranks[r],
+                          *comm,
+                          stream));
+      CHECK_NCCL(ncclRecv(sizes_per_segment_global.ptr(r * num_segments_l_aligned),
+                          num_segments_l_aligned,
+                          ncclUint64,
+                          sort_ranks[r],
+                          *comm,
+                          stream));
+    }
+    CHECK_NCCL(ncclGroupEnd());
+    sizes_per_segment.destroy();
+
+    // transpose to [num_segments_l_aligned][rank]
+    auto sizes_per_segment_global_transposed =
+      create_buffer<size_t>(num_segments_l_aligned * num_sort_ranks, Memory::GPU_FB_MEM);
+    {
+      dim3 grid((num_segments_l_aligned + BLOCK_DIM - 1) / BLOCK_DIM,
+                (num_sort_ranks + BLOCK_DIM - 1) / BLOCK_DIM);
+      dim3 block(BLOCK_DIM, BLOCK_DIM);
+      transpose<<<grid, block, 0, stream>>>(sizes_per_segment_global_transposed.ptr(0),
+                                            sizes_per_segment_global.ptr(0),
+                                            num_segments_l_aligned,
+                                            num_sort_ranks);
+    }
+    sizes_per_segment_global.destroy();
+
+    // row-scan in place
+    compute_scan_per_row<<<num_segments_l, THREADS_PER_BLOCK, 0, stream>>>(
+      sizes_per_segment_global_transposed.ptr(0),
+      sizes_per_segment_global_transposed.ptr(0),
+      num_sort_ranks,
+      false);
+
+    // check for every k
+    // need row-scan, partition_kths_buffer
+    // result should be [partition_kths_buffer] with entry -> rank
+    auto partition_kths_buffer = create_buffer<int64_t>(partition_kths.size(), Memory::GPU_FB_MEM);
+    CHECK_CUDA(cudaMemcpyAsync(partition_kths_buffer.ptr(0),
+                               partition_kths.data(),
+                               partition_kths.size() * sizeof(int64_t),
+                               cudaMemcpyHostToDevice,
+                               stream));
+
+    // what we really need is the max splitter <= my_sort_rank && min splitter >= local sort
+    // if either is == my_sort_rank we cannot skip any communication
+    // otherwise only ranks!=my_sort_rank  with maxS < rank < minS can be discarded upon
+    // communication
+    int64_t max_lower, min_higher;
+    {
+      dim3 grid((num_segments_l + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
+                partition_kths.size());
+      size_t num_blocks         = grid.x * grid.y;
+      auto max_lower_per_block  = create_buffer<int64_t>(num_blocks, Memory::GPU_FB_MEM);
+      auto min_higher_per_block = create_buffer<int64_t>(num_blocks, Memory::GPU_FB_MEM);
+      extract_ranks_for_partition<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
+        max_lower_per_block.ptr(0),
+        min_higher_per_block.ptr(0),
+        partition_kths_buffer.ptr(0),
+        sizes_per_segment_global_transposed.ptr(0),
+        partition_kths.size(),
+        num_segments_l,
+        my_sort_rank,
+        num_sort_ranks);
+
+      max_lower  = thrust::reduce(exec_policy,
+                                 max_lower_per_block.ptr(0),
+                                 max_lower_per_block.ptr(0) + num_blocks,
+                                 -1,
+                                 thrust::maximum<int64_t>());
+      min_higher = thrust::reduce(exec_policy,
+                                  min_higher_per_block.ptr(0),
+                                  min_higher_per_block.ptr(0) + num_blocks,
+                                  num_sort_ranks,
+                                  thrust::minimum<int64_t>());
+
+      sizes_per_segment_global_transposed.destroy();
+      partition_kths_buffer.destroy();
+      max_lower_per_block.destroy();
+      min_higher_per_block.destroy();
+    }
+
+    skip_comm_ranks.insert(my_sort_rank);
+    if (max_lower != my_sort_rank && min_higher != my_sort_rank) {
+      for (size_t rank = (size_t)(max_lower + 1); rank < min_higher; rank++) {
+        if (rank != my_sort_rank) skip_comm_ranks.insert(rank);
+      }
+    }
+  }
+
   // we need the amount of data to transfer on the host --> get it
-  // FIXME auto kind = CuNumeric::has_numamem ? Memory::Kind::SOCKET_MEM : Memory::Kind::SYSTEM_MEM;
   Buffer<size_t> size_send_total = create_buffer<size_t>(num_sort_ranks, Memory::Z_COPY_MEM);
   Buffer<size_t> size_recv_total = create_buffer<size_t>(num_sort_ranks, Memory::Z_COPY_MEM);
   {
@@ -1572,36 +1813,37 @@ void sample_sort_nccl_nd(SortPiece<legate_type_of<CODE>> local_sorted,
   std::vector<SegmentMergePiece<VAL>> merge_buffers(num_sort_ranks);
   {
     for (size_t r = 0; r < num_sort_ranks; ++r) {
-      auto size = size_recv_total[r];
+      bool is_valid = is_rank_valid(skip_comm_ranks, r);
+      size_t size   = is_valid ? size_recv_total[r] : size_send_total[r];
 
       merge_buffers[r].size = size;
 
       // initialize segment information
       if (num_segments_l > 1) {
         merge_buffers[r].segments = create_buffer<size_t>(size, Memory::GPU_FB_MEM);
-        // 0  1  2  1  3      // counts per segment to receive
-        // 0  1  3  4  7
-        // 0 1 2 3 4 5 6
-        // 1 1 0 1 1 0 0
-        // 1 2 2 3 4 4 4      // segment id for all received elements
-        thrust::inclusive_scan(exec_policy,
-                               size_recv.ptr(r * num_segments_l_aligned),
-                               size_recv.ptr(r * num_segments_l_aligned) + num_segments_l + 1,
-                               size_recv.ptr(r * num_segments_l_aligned));
-        CHECK_CUDA(
-          cudaMemsetAsync(merge_buffers[r].segments.ptr(0), 0, size * sizeof(size_t), stream));
-        const size_t num_blocks = (num_segments_l + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        assert(sizeof(unsigned long long int) ==
-               sizeof(size_t));  // kernel needs to cast for atomicAdd...
-        initialize_segment_start_positions<<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-          size_recv.ptr(r * num_segments_l_aligned),
-          num_segments_l - 1,
-          merge_buffers[r].segments.ptr(0),
-          merge_buffers[r].size);
-        thrust::inclusive_scan(exec_policy,
-                               merge_buffers[r].segments.ptr(0),
-                               merge_buffers[r].segments.ptr(0) + size,
-                               merge_buffers[r].segments.ptr(0));
+        if (size > 0) {
+          // 0  1  2  1  3      // counts per segment to receive
+          // 0  1  3  4  7
+          // 0 1 2 3 4 5 6
+          // 1 1 0 1 1 0 0
+          // 1 2 2 3 4 4 4      // segment id for all received elements
+
+          size_t* data_recv = is_valid ? size_recv.ptr(r * num_segments_l_aligned)
+                                       : size_send.ptr(r * num_segments_l_aligned);
+
+          thrust::inclusive_scan(exec_policy, data_recv, data_recv + num_segments_l + 1, data_recv);
+          CHECK_CUDA(
+            cudaMemsetAsync(merge_buffers[r].segments.ptr(0), 0, size * sizeof(size_t), stream));
+          const size_t num_blocks = (num_segments_l + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+          assert(sizeof(unsigned long long int) ==
+                 sizeof(size_t));  // kernel needs to cast for atomicAdd...
+          initialize_segment_start_positions<<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+            data_recv, num_segments_l - 1, merge_buffers[r].segments.ptr(0), merge_buffers[r].size);
+          thrust::inclusive_scan(exec_policy,
+                                 merge_buffers[r].segments.ptr(0),
+                                 merge_buffers[r].segments.ptr(0) + size,
+                                 merge_buffers[r].segments.ptr(0));
+        }
       }
 
       merge_buffers[r].values = create_buffer<VAL>(size, Memory::GPU_FB_MEM);
@@ -1615,33 +1857,57 @@ void sample_sort_nccl_nd(SortPiece<legate_type_of<CODE>> local_sorted,
     CHECK_CUDA_STREAM(stream);
   }
 
+  for (auto r : skip_comm_ranks) {
+    assert(size_send_total[r] == size_send_total[r]);
+    CHECK_CUDA(cudaMemcpyAsync(merge_buffers[r].values.ptr(0),
+                               val_send_buffers[r].ptr(0),
+                               size_send_total[r] * sizeof(VAL),
+                               cudaMemcpyDeviceToDevice,
+                               stream));
+  }
+
   // communicate all2all (in sort dimension)
   CHECK_NCCL(ncclGroupStart());
   for (size_t r = 0; r < num_sort_ranks; r++) {
+    bool is_valid = is_rank_valid(skip_comm_ranks, r);
+    if (!is_valid) continue;
     CHECK_NCCL(ncclSend(val_send_buffers[r].ptr(0),
                         size_send_total[r] * sizeof(VAL),
                         ncclInt8,
-                        sort_ranks[r],
+                        is_valid ? sort_ranks[r] : my_rank,
                         *comm,
                         stream));
     CHECK_NCCL(ncclRecv(merge_buffers[r].values.ptr(0),
                         merge_buffers[r].size * sizeof(VAL),
                         ncclInt8,
-                        sort_ranks[r],
+                        is_valid ? sort_ranks[r] : my_rank,
                         *comm,
                         stream));
   }
   CHECK_NCCL(ncclGroupEnd());
 
   if (argsort) {
+    for (auto r : skip_comm_ranks) {
+      CHECK_CUDA(cudaMemcpyAsync(merge_buffers[r].indices.ptr(0),
+                                 idc_send_buffers[r].ptr(0),
+                                 size_send_total[r] * sizeof(int64_t),
+                                 cudaMemcpyDeviceToDevice,
+                                 stream));
+    }
     CHECK_NCCL(ncclGroupStart());
     for (size_t r = 0; r < num_sort_ranks; r++) {
-      CHECK_NCCL(ncclSend(
-        idc_send_buffers[r].ptr(0), size_send_total[r], ncclInt64, sort_ranks[r], *comm, stream));
+      bool is_valid = is_rank_valid(skip_comm_ranks, r);
+      if (!is_valid) continue;
+      CHECK_NCCL(ncclSend(idc_send_buffers[r].ptr(0),
+                          size_send_total[r],
+                          ncclInt64,
+                          is_valid ? sort_ranks[r] : my_rank,
+                          *comm,
+                          stream));
       CHECK_NCCL(ncclRecv(merge_buffers[r].indices.ptr(0),
                           merge_buffers[r].size,
                           ncclInt64,
-                          sort_ranks[r],
+                          is_valid ? sort_ranks[r] : my_rank,
                           *comm,
                           stream));
     }
@@ -1721,6 +1987,7 @@ struct SortImplBody<VariantKind::GPU, CODE, DIM> {
                   const size_t segment_size_g,
                   const bool argsort,
                   const bool stable,
+                  const std::vector<int64_t>& partition_kths,
                   const bool is_index_space,
                   const size_t local_rank,
                   const size_t num_ranks,
@@ -1836,6 +2103,7 @@ struct SortImplBody<VariantKind::GPU, CODE, DIM> {
                                   segment_size_l,
                                   rebalance,
                                   argsort,
+                                  partition_kths,
                                   stream,
                                   comms[0].get<ncclComm_t*>());
       } else {
